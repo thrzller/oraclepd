@@ -1,0 +1,12 @@
+# 2023
+
+6 critical-severity Oracle CVEs, highest CVSS first.
+
+| CVE | CVSS |
+| --- | ---: |
+| [CVE-2023-21890](CVE-2023-21890/README.md) | 9.8 |
+| [CVE-2023-22069](CVE-2023-22069/README.md) | 9.8 |
+| [CVE-2023-22072](CVE-2023-22072/README.md) | 9.8 |
+| [CVE-2023-22089](CVE-2023-22089/README.md) | 9.8 |
+| [CVE-2023-21974](CVE-2023-21974/README.md) | 9.0 |
+| [CVE-2023-21975](CVE-2023-21975/README.md) | 9.0 |
