@@ -1,14 +1,12 @@
 name: Update Oracle CVE tracker
 
-# Oracle ships its Critical Patch Update quarterly, but out-of-band security
-# alerts appear at any time, so we check daily rather than on a CPU calendar.
 on:
   schedule:
-    # 06:20 UTC. Avoid the top of the hour: scheduled jobs queue heavily there
-    # and GitHub may delay or drop them under load.
     - cron: '20 6 * * *'
+    - cron: '40 7 * * 1'
+    - cron: '10 20-23 * * 2'
+    - cron: '10 0-3 * * 3'
 
-  # Lets you trigger a run by hand, including a historical backfill.
   workflow_dispatch:
     inputs:
       mode:
@@ -24,12 +22,9 @@ on:
         type: boolean
         default: false
 
-# The job writes to the repository, so it needs write access to contents.
-# Everything else stays at no permission, which is the least-privilege default.
 permissions:
   contents: write
 
-# Two concurrent runs would race on the same commit and one would fail to push.
 concurrency:
   group: update-cves
   cancel-in-progress: false
@@ -39,55 +34,103 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
+    env:
+      DAILY_CRON: '20 6 * * *'
+      RECONCILE_CRON: '40 7 * * 1'
+      RECONCILE_WINDOW_DAYS: '60'
+      DELTA_OVERLAP_DAYS: '2'
+      PATCH_DOM_FIRST: '14'
+      PATCH_DOM_LAST: '21'
+
     steps:
+      - name: Decide whether this run should do any work
+        id: window
+        env:
+          TRIGGER_CRON: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+
+          case "${TRIGGER_CRON:-}" in
+            ''|"$DAILY_CRON"|"$RECONCILE_CRON")
+              echo 'proceed=true' >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          WEEKDAY=$(TZ=America/Los_Angeles date '+%u')
+          DAY_OF_MONTH=$(TZ=America/Los_Angeles date '+%-d')
+
+          if [ "$WEEKDAY" = '2' ] \
+             && [ "$DAY_OF_MONTH" -ge "$PATCH_DOM_FIRST" ] \
+             && [ "$DAY_OF_MONTH" -le "$PATCH_DOM_LAST" ]; then
+            echo "Patch Tuesday in Pacific time (the ${DAY_OF_MONTH}th); checking for new CVEs."
+            echo 'proceed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "Pacific weekday ${WEEKDAY}, day ${DAY_OF_MONTH}: not a patch Tuesday, nothing to do."
+            echo 'proceed=false' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out repository
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
+        if: steps.window.outputs.proceed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # No dependency install step: the script uses only the standard library,
-      # so there is nothing to pip install and no supply chain to audit.
 
       - name: Fetch critical Oracle CVEs
+        if: steps.window.outputs.proceed == 'true'
         env:
-          # Optional. Raises the NVD rate limit from 5 to 50 requests per 30s.
-          # Request one at https://nvd.nist.gov/developers/request-an-api-key
-          # and store it as a repository secret; never commit it.
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-          # Makes the links in generated pages point at this repository.
-          TRACKER_REPO: ${{ github.repository }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_SINCE: ${{ inputs.since }}
+          INPUT_FORCE: ${{ inputs.force }}
+          TRIGGER_CRON: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
-          ARGS=(--mode "${{ inputs.mode || 'delta' }}")
 
-          # Two days of overlap in delta mode, so a single failed or skipped
-          # run cannot leave a permanent gap in coverage.
-          if [ "${{ inputs.mode || 'delta' }}" = "delta" ]; then
-            ARGS+=(--days 2)
+          MODE="${INPUT_MODE:-}"
+          SINCE="${INPUT_SINCE:-}"
+
+          if [ -z "$MODE" ]; then
+            if [ "${TRIGGER_CRON:-}" = "$RECONCILE_CRON" ]; then
+              MODE=backfill
+              SINCE=$(date -u -d "${RECONCILE_WINDOW_DAYS} days ago" '+%Y-%m-%d')
+              echo "Weekly reconcile: re-checking Oracle CVEs since ${SINCE}."
+            else
+              MODE=delta
+            fi
+          fi
+
+          ARGS=(--mode "$MODE")
+
+          if [ "$MODE" = 'delta' ]; then
+            ARGS+=(--days "$DELTA_OVERLAP_DAYS")
           else
-            if [ -z "${{ inputs.since }}" ]; then
+            if [ -z "$SINCE" ]; then
               echo "::error::backfill mode requires a 'since' date"
               exit 1
             fi
-            ARGS+=(--since "${{ inputs.since }}")
+            ARGS+=(--since "$SINCE")
           fi
 
-          if [ "${{ inputs.force }}" = "true" ]; then
+          if [ "${INPUT_FORCE:-false}" = 'true' ]; then
             ARGS+=(--force)
           fi
 
           python3 scripts/fetch_oracle_cves.py "${ARGS[@]}"
 
       - name: Commit any new or changed pages
+        if: steps.window.outputs.proceed == 'true'
         run: |
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
 
-          # Committing with no staged changes exits non-zero and would mark the
-          # run as failed, so check first and exit cleanly when nothing changed.
           if git diff --quiet && git diff --cached --quiet; then
             echo 'No changes to commit.'
             exit 0
@@ -97,7 +140,5 @@ jobs:
           COUNT=$(git diff --cached --name-only | grep -c 'README.md$' || true)
           git commit -m "chore: sync critical Oracle CVEs (${COUNT} pages changed)"
 
-          # Another run may have pushed while this one worked; rebase rather
-          # than force-push so no commit is discarded.
           git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
           git push
