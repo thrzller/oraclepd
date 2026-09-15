@@ -12,8 +12,10 @@ Two discovery modes feed one shared renderer:
            updated records. This is the fast path -- it sees an Oracle CVE
            within the hour. Used by CI.
   backfill Enumerate Oracle CVEs over a historical date range using the NVD
-           API, which can filter by CPE vendor server-side. Used once to
-           populate the repository.
+           API, which can filter by CPE vendor server-side. Used to populate
+           the repository, and weekly by CI over a rolling window to reconcile
+           anything the delta path could not see: a skipped run, or a record
+           that only became Oracle's or only became critical after publication.
 
 Patch binaries are never mirrored here. Oracle distributes them only through
 My Oracle Support under a support contract; pages link to Oracle's advisories.
@@ -49,11 +51,26 @@ NVD_PAGE_SIZE = 2000
 # and turns a few hundred sequential fetches into a few seconds of work.
 RAW_WORKERS = 8
 
-REPO_SLUG = os.environ.get("TRACKER_REPO", "REPLACE_ME/oracle-cve-tracker")
-REPO_URL = f"https://github.com/{REPO_SLUG}"
 CHANNEL_URL = "https://t.me/oraclepdchannel"
 BOT_URL = "https://t.me/oraclepdbot"
 ORACLE_ADVISORY_URL = "https://www.oracle.com/security-alerts/"
+
+# Every CVE page opens with this block, directly under the CVE ID. It lives
+# here rather than in the pages themselves so that regenerating a page
+# reproduces the committed file byte for byte: the generator stays the single
+# source of truth for page layout, and a page that did not change on disk
+# produces no commit noise.
+TELEGRAM_BLOCK = [
+    "## Telegram",
+    "",
+    "| Channel | What it does |",
+    "| --- | --- |",
+    f"| [@oraclepdchannel]({CHANNEL_URL}) | Notification channel for updates related to the bot and Oracle. |",
+    f"| [@oraclepdbot]({BOT_URL}) | Helps users download Oracle patches at a low price. |",
+    "",
+    "---",
+    "",
+]
 
 CVE_ID_PATTERN = re.compile(r"^CVE-(\d{4})-(\d{4,})$")
 # A real weakness classification starts with a CWE identifier, e.g.
@@ -75,7 +92,7 @@ def http_get_json(url: str, headers: dict | None = None, max_retries: int = 4):
     A 404 means the record genuinely is not there and retrying cannot help, so
     non-retryable statuses raise immediately instead of burning the retry budget.
     """
-    request_headers = {"User-Agent": "oracle-cve-tracker/1.0"}
+    request_headers = {"User-Agent": "oracle-research-poc/1.0"}
     if headers:
         request_headers.update(headers)
 
@@ -389,6 +406,7 @@ def render_page(record: dict) -> str:
     lines = [
         f"# {cve_id}",
         "",
+        *TELEGRAM_BLOCK,
         f"Critical-severity vulnerability affecting Oracle products. "
         f"Published {published} by CNA `{assigner}`.",
         "",
@@ -455,16 +473,7 @@ def render_page(record: dict) -> str:
         if len(seen_urls) >= 12:
             break
 
-    lines += [
-        "",
-        "---",
-        "",
-        f"Tracked by [oracle-cve-tracker]({REPO_URL}), which follows critical-severity",
-        "Oracle CVEs from the CVE Program's published records.",
-        f"New entries are announced on [@oraclepdchannel]({CHANNEL_URL}), and",
-        f"[@oraclepdbot]({BOT_URL}) searches this dataset and filters alerts by product.",
-        "",
-    ]
+    lines.append("")  # Trailing newline, so the file ends the way git expects.
     return "\n".join(lines)
 
 
@@ -481,14 +490,43 @@ def tracked_ids(root: Path) -> set[str]:
     return found
 
 
-def write_pages(records: list[dict], root: Path, force: bool) -> tuple[int, int]:
-    """Write one folder per qualifying CVE. Returns (new, updated) counts."""
-    new_count = updated_count = 0
+def remove_page(root: Path, cve_id: str) -> bool:
+    """Delete the folder of a CVE the CVE Program has withdrawn.
+
+    A rejected record is one the Program says never was a vulnerability, so
+    leaving the page would keep asserting a critical issue that no longer
+    exists. The deletion is deliberately narrow -- a directory named exactly
+    after the CVE that holds nothing but our generated README -- so a stray ID
+    can never take anything else with it.
+    """
+    for year_dir in root.glob("[0-9][0-9][0-9][0-9]"):
+        page_dir = year_dir / cve_id
+        page = page_dir / "README.md"
+        if not page.is_file():
+            continue
+        if [p.name for p in page_dir.iterdir()] != ["README.md"]:
+            print(f"  {cve_id} rejected upstream but its folder holds other "
+                  f"files; leaving it alone", file=sys.stderr)
+            return False
+        page.unlink()
+        page_dir.rmdir()
+        print(f"  {cve_id} withdrawn upstream; page removed", file=sys.stderr)
+        return True
+    return False
+
+
+def write_pages(records: list[dict], root: Path, force: bool) -> tuple[int, int, int]:
+    """Write one folder per qualifying CVE. Returns (new, updated, removed)."""
+    new_count = updated_count = removed_count = 0
 
     for record in records:
         meta = record.get("cveMetadata", {})
         cve_id = meta.get("cveId")
-        if not cve_id or meta.get("state") == "REJECTED":
+        if not cve_id:
+            continue
+        if meta.get("state") == "REJECTED":
+            if remove_page(root, cve_id):
+                removed_count += 1
             continue
         if not is_oracle(record) or not is_critical(record):
             continue
@@ -509,37 +547,88 @@ def write_pages(records: list[dict], root: Path, force: bool) -> tuple[int, int]
             page_path.write_text(content, encoding="utf-8")
             new_count += 1
 
-    return new_count, updated_count
+    return new_count, updated_count, removed_count
+
+SCORE_LINE = re.compile(r"^\| CVSS base score \| ([\d.]+) \|$", re.MULTILINE)
+
+
+def page_score(page_path: Path) -> float:
+    """Read the CVSS score back out of a generated page.
+
+    The index needs a score per CVE, and re-fetching thousands of records just
+    to build a listing would be wasteful. The page is our own output in a fixed
+    format, so reading it back is cheap; an unparseable page sorts last rather
+    than breaking the run.
+    """
+    try:
+        match = SCORE_LINE.search(page_path.read_text(encoding="utf-8"))
+        return float(match.group(1)) if match else 0.0
+    except (OSError, ValueError):
+        return 0.0
 
 
 def write_index(root: Path) -> int:
-    """Regenerate INDEX.md listing every tracked CVE, newest year first."""
+    """Write the root index and one index per year. Returns the total tracked.
+
+    Each year gets its own index because a single flat list spanning a decade
+    runs to thousands of lines, which no reader will scroll and which GitHub
+    renders slowly.
+    """
     year_dirs = sorted(
-        (p for p in root.glob("[0-9][0-9][0-9][0-9]") if p.is_dir()),
-        key=lambda p: p.name,
+        (d for d in root.glob("[0-9][0-9][0-9][0-9]") if d.is_dir()),
+        key=lambda d: d.name,
         reverse=True,
     )
 
-    lines = [
+    root_lines = [
         "# Tracked CVEs",
         "",
-        "Every critical-severity Oracle CVE this repository tracks, grouped by the",
-        "year the record was published. Generated by `scripts/fetch_oracle_cves.py`.",
+        "Critical-severity Oracle CVEs, one page each, grouped by the year the",
+        "record was published. Generated by `scripts/fetch_oracle_cves.py`.",
         "",
+        "| Year | Critical CVEs | |",
+        "| --- | ---: | --- |",
     ]
     total = 0
+
     for year_dir in year_dirs:
-        entries = sorted((p.name for p in year_dir.iterdir() if p.is_dir()), reverse=True)
-        if not entries:
+        pages = [
+            (d.name, year_dir / d.name / "README.md")
+            for d in year_dir.iterdir()
+            if d.is_dir() and (year_dir / d.name / "README.md").exists()
+        ]
+        if not pages:
             continue
-        lines += [f"## {year_dir.name} ({len(entries)})", ""]
-        lines += [f"- [{cve}]({year_dir.name}/{cve}/README.md)" for cve in entries]
-        lines.append("")
-        total += len(entries)
 
-    (root / "INDEX.md").write_text("\n".join(lines), encoding="utf-8")
+        # Highest score first: a reader scanning a year wants the worst first.
+        scored = sorted(
+            ((cve, page_score(page)) for cve, page in pages),
+            key=lambda item: (-item[1], item[0]),
+        )
+
+        year_lines = [
+            f"# {year_dir.name}",
+            "",
+            f"{len(scored)} critical-severity Oracle CVEs, highest CVSS first.",
+            "",
+            "| CVE | CVSS |",
+            "| --- | ---: |",
+        ]
+        year_lines += [
+            f"| [{cve}]({cve}/README.md) | {score if score else 'n/a'} |"
+            for cve, score in scored
+        ]
+        year_lines.append("")
+        (year_dir / "INDEX.md").write_text("\n".join(year_lines), encoding="utf-8")
+
+        root_lines.append(
+            f"| **{year_dir.name}** | {len(scored)} | [browse]({year_dir.name}/INDEX.md) |"
+        )
+        total += len(scored)
+
+    root_lines += ["", f"**{total} CVEs tracked in total.**", ""]
+    (root / "INDEX.md").write_text("\n".join(root_lines), encoding="utf-8")
     return total
-
 
 # --------------------------------------------------------------------------
 
@@ -593,11 +682,12 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    new_count, updated_count = write_pages(records, root, args.force)
+    new_count, updated_count, removed_count = write_pages(records, root, args.force)
     total = write_index(root)
 
     print(f"Inspected {len(records)} records: {new_count} new, "
-          f"{updated_count} updated, {total} tracked in total.")
+          f"{updated_count} updated, {removed_count} removed, "
+          f"{total} tracked in total.")
     return 0
 
 
