@@ -41,6 +41,8 @@ jobs:
       DELTA_OVERLAP_DAYS: '2'
       PATCH_DOM_FIRST: '14'
       PATCH_DOM_LAST: '21'
+      HEARTBEAT_FILE: '.github/heartbeat.txt'
+      HEARTBEAT_AFTER_DAYS: '30'
 
     steps:
       - name: Decide whether this run should do any work
@@ -131,14 +133,25 @@ jobs:
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
 
-          if git diff --quiet && git diff --cached --quiet; then
-            echo 'No changes to commit.'
-            exit 0
+          git add -A
+
+          if ! git diff --cached --quiet; then
+            COUNT=$(git diff --cached --name-only | grep -c 'README.md$' || true)
+            MESSAGE="chore: sync critical Oracle CVEs (${COUNT} pages changed)"
+          else
+            QUIET_DAYS=$(( ( $(date -u '+%s') - $(git log -1 --format='%ct') ) / 86400 ))
+            if [ "$QUIET_DAYS" -lt "$HEARTBEAT_AFTER_DAYS" ]; then
+              echo "No changes to commit; last commit was ${QUIET_DAYS} day(s) ago."
+              exit 0
+            fi
+            printf '%s\n' \
+              'Touched by the update-cves workflow so GitHub keeps its schedules enabled.' \
+              "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$HEARTBEAT_FILE"
+            git add "$HEARTBEAT_FILE"
+            MESSAGE="chore: keep scheduled runs alive after ${QUIET_DAYS} quiet days"
           fi
 
-          git add -A
-          COUNT=$(git diff --cached --name-only | grep -c 'README.md$' || true)
-          git commit -m "chore: sync critical Oracle CVEs (${COUNT} pages changed)"
+          git commit -m "$MESSAGE"
 
           git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
           git push
