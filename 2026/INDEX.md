@@ -1,6 +1,6 @@
 # 2026
 
-514 critical-severity Oracle CVEs, highest CVSS first.
+515 critical-severity Oracle CVEs, highest CVSS first.
 
 | CVE | CVSS |
 | --- | ---: |
@@ -505,6 +505,7 @@
 | [CVE-2026-91265](CVE-2026-91265/README.md) | 9.1 |
 | [CVE-2026-91305](CVE-2026-91305/README.md) | 9.1 |
 | [CVE-2026-91341](CVE-2026-91341/README.md) | 9.1 |
+| [CVE-2026-91403](CVE-2026-91403/README.md) | 9.1 |
 | [CVE-2026-91490](CVE-2026-91490/README.md) | 9.1 |
 | [CVE-2026-91624](CVE-2026-91624/README.md) | 9.1 |
 | [CVE-2026-91655](CVE-2026-91655/README.md) | 9.1 |
